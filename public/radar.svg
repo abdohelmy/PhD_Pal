@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160" role="img" aria-label="Course radar">
+  <rect width="160" height="160" rx="26" fill="#e9f3ee"/>
+  <circle cx="80" cy="80" r="58" fill="#ffffff" stroke="#1f7a57" stroke-width="4"/>
+  <circle cx="80" cy="80" r="36" fill="none" stroke="#9ccbb8" stroke-width="3"/>
+  <circle cx="80" cy="80" r="14" fill="none" stroke="#9ccbb8" stroke-width="3"/>
+  <path d="M80 80 L123 45" stroke="#b76c25" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="122" cy="45" r="9" fill="#b76c25"/>
+  <circle cx="54" cy="105" r="7" fill="#256f93"/>
+  <circle cx="105" cy="95" r="6" fill="#1f7a57"/>
+  <path d="M80 20 V140 M20 80 H140" stroke="#d4e5dc" stroke-width="2"/>
+</svg>

@@ -1,0 +1,5 @@
+data/*.json
+data/outbox/
+__pycache__/
+*.pyc
+.DS_Store

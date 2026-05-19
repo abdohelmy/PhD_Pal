@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Danish PhD Course Agent</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="workspace">
+        <aside class="sidebar" aria-label="Student profile">
+          <div class="brand">
+            <img src="/radar.svg" alt="" />
+            <div>
+              <p class="eyebrow">Course radar</p>
+              <h1>Danish PhD course agent</h1>
+            </div>
+          </div>
+
+          <form id="profile-form" class="profile-form">
+            <label>
+              Email for weekly summary
+              <input name="email" type="email" placeholder="name@university.dk" />
+            </label>
+
+            <fieldset class="checklist-field">
+              <legend>Preferred universities</legend>
+              <div class="checklist" id="university-list"></div>
+            </fieldset>
+
+            <label>
+              PhD school or department
+              <input name="school" placeholder="e.g. DTU Department of Health Technology" />
+            </label>
+
+            <label class="check-row">
+              <input name="includeOtherSchools" type="checkbox" id="include-other-schools" />
+              Include courses from other PhD schools
+            </label>
+
+            <fieldset class="checklist-field" id="other-schools-field" hidden>
+              <legend>Other PhD schools to include</legend>
+              <div class="checklist" id="phd-school-list"></div>
+            </fieldset>
+
+            <label>
+              Study programme or discipline
+              <input name="studyProgram" placeholder="e.g. biomedical engineering, anthropology" />
+            </label>
+
+            <label>
+              Research area
+              <select name="area" id="area"></select>
+            </label>
+
+            <label>
+              Research direction
+              <textarea
+                name="researchDirection"
+                rows="3"
+                placeholder="e.g. trustworthy AI for clinical decision support"
+              ></textarea>
+            </label>
+
+            <label>
+              Interests and learning goals
+              <textarea
+                name="interests"
+                rows="3"
+                placeholder="e.g. causal inference, interpretability, scientific writing"
+              ></textarea>
+            </label>
+
+            <label>
+              Project topic
+              <textarea
+                name="topic"
+                rows="3"
+                placeholder="e.g. causal inference for clinical prediction models"
+              ></textarea>
+            </label>
+
+            <label>
+              Methods and keywords
+              <input name="keywords" placeholder="python, interviews, ML, chromatography..." />
+            </label>
+
+            <div class="field-grid">
+              <label>
+                Preferred city
+                <input name="location" placeholder="Copenhagen" />
+              </label>
+              <label>
+                Min. ECTS
+                <input name="minEcts" type="number" min="0" step="0.5" placeholder="1" />
+              </label>
+            </div>
+
+            <label class="check-row">
+              <input name="includeGeneric" type="checkbox" />
+              Include generic research-skill courses
+            </label>
+
+            <div class="actions">
+              <button class="primary" type="submit">Recommend</button>
+              <button class="secondary" type="button" id="refresh">Refresh source</button>
+            </div>
+          </form>
+        </aside>
+
+        <section class="results-panel" aria-live="polite">
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">Source: phdcourses.dk</p>
+              <h2>Upcoming courses matched to your PhD profile</h2>
+            </div>
+            <div class="status-card">
+              <span id="course-count">0</span>
+              <small>cached courses</small>
+            </div>
+          </header>
+
+          <section class="summary-strip">
+            <div>
+              <strong id="last-scraped">Not scraped yet</strong>
+              <span>Latest scrape</span>
+            </div>
+            <div>
+              <strong id="match-count">0</strong>
+              <span>Current matches</span>
+            </div>
+            <div>
+              <strong id="recommender-mode">Lexical</strong>
+              <span>Recommendation mode</span>
+            </div>
+            <div>
+              <strong id="reasoning-mode">Off</strong>
+              <span>Reasoning LLM</span>
+            </div>
+          </section>
+
+          <div id="message" class="message">
+            Enter a profile and run recommendations. The app can refresh the course cache from
+            phdcourses.dk and create weekly email digests.
+          </div>
+
+          <section id="insights" class="insights"></section>
+
+          <section id="results" class="results"></section>
+
+          <section class="cluster-panel">
+            <div class="cluster-head">
+              <div>
+                <p class="eyebrow">Subscriber optimization</p>
+                <h3>User clusters</h3>
+              </div>
+              <button class="secondary compact" type="button" id="load-clusters">Refresh clusters</button>
+            </div>
+            <div id="clusters" class="clusters"></div>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

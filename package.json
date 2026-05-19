@@ -1,0 +1,16 @@
+{
+  "name": "danish-phd-course-agent",
+  "version": "0.1.0",
+  "description": "A recommendation agent for Danish PhD courses from phdcourses.dk.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs",
+    "scrape": "node server.mjs --scrape-once",
+    "digest": "node server.mjs --digest-once"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
