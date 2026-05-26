@@ -106,6 +106,14 @@ Use these model servers for either backend.
 
 Start Qwen3-14B for reasoning:
 
+One-line version:
+
+```sh
+vllm serve Qwen/Qwen3-14B --dtype auto --max-model-len 32768 --gpu-memory-utilization 0.84 --port 8000
+```
+
+Multi-line version:
+
 ```sh
 vllm serve Qwen/Qwen3-14B \
   --dtype auto \
@@ -116,14 +124,23 @@ vllm serve Qwen/Qwen3-14B \
 
 Start BGE-M3 for embeddings:
 
+One-line version:
+
+```sh
+vllm serve BAAI/bge-m3 --hf-overrides '{"architectures": ["BgeM3EmbeddingModel"]}' --dtype auto --gpu-memory-utilization 0.12 --port 8001
+```
+
+Multi-line version:
+
 ```sh
 vllm serve BAAI/bge-m3 \
-  --task embed \
   --hf-overrides '{"architectures": ["BgeM3EmbeddingModel"]}' \
   --dtype auto \
   --gpu-memory-utilization 0.12 \
   --port 8001
 ```
+
+If you use the multi-line version, the `\` must be the final character on the line. Do not put spaces after it. Some vLLM versions support `--task embed`; yours does not, so leave it out.
 
 Then run the Python backend with:
 
