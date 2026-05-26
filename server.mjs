@@ -19,13 +19,28 @@ const USER_AGENT =
   "Danish PhD Course Recommendation Agent/0.1 (+local research prototype; contact owner)";
 const PORT = Number(process.env.PORT || 3000);
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-const HF_EMBEDDING_MODEL =
-  process.env.HF_EMBEDDING_MODEL || "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
+const HF_EMBEDDING_MODEL = process.env.HF_EMBEDDING_MODEL || "BAAI/bge-m3";
 const HF_FEATURE_ENDPOINT = `https://api-inference.huggingface.co/pipeline/feature-extraction/${HF_EMBEDDING_MODEL}`;
-const HF_REASONING_MODEL = process.env.HF_REASONING_MODEL || "deepseek-ai/DeepSeek-R1:fastest";
-const HF_CHAT_ENDPOINT = "https://router.huggingface.co/v1/chat/completions";
+const EMBEDDING_ENDPOINT = process.env.EMBEDDING_ENDPOINT || HF_FEATURE_ENDPOINT;
+const EMBEDDING_API_KEY = process.env.EMBEDDING_API_KEY || "";
+const HF_REASONING_MODEL = process.env.HF_REASONING_MODEL || "Qwen/Qwen3-14B";
+const HF_CHAT_ENDPOINT =
+  process.env.LLM_CHAT_ENDPOINT || "https://router.huggingface.co/v1/chat/completions";
+const LLM_API_KEY = process.env.LLM_API_KEY || "";
 const REASONING_REFRESH_MS =
   Number(process.env.REASONING_REFRESH_DAYS || 21) * 24 * 60 * 60 * 1000;
+const SEMANTIC_CANDIDATE_LIMIT = Number(process.env.SEMANTIC_CANDIDATE_LIMIT || 60);
+const SEMANTIC_CANDIDATE_THRESHOLD = Number(process.env.SEMANTIC_CANDIDATE_THRESHOLD || 0.25);
+const LLM_RERANK_CHUNK_SIZE = Math.max(
+  5,
+  Math.min(10, Number(process.env.LLM_RERANK_CHUNK_SIZE || 8))
+);
+const LLM_RERANK_FINALIST_LIMIT = Number(process.env.LLM_RERANK_FINALIST_LIMIT || 20);
+const PROFILE_INSIGHTS_MAX_TOKENS = Number(process.env.PROFILE_INSIGHTS_MAX_TOKENS || 1200);
+const COURSE_SUMMARY_MAX_TOKENS = Number(process.env.COURSE_SUMMARY_MAX_TOKENS || 1400);
+const LLM_RERANK_MAX_TOKENS = Number(process.env.LLM_RERANK_MAX_TOKENS || 2200);
+const CLUSTER_INSIGHTS_MAX_TOKENS = Number(process.env.CLUSTER_INSIGHTS_MAX_TOKENS || 1800);
+const LLM_JSON_THINKING_MODE = String(process.env.LLM_JSON_THINKING_MODE || "off").toLowerCase();
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -422,14 +437,14 @@ async function summarizeCourseWithLlm(course = {}) {
         {
           role: "system",
           content:
-            "You summarize PhD course pages for a course recommendation system. Return only valid JSON."
+            `You summarize PhD course pages for a course recommendation system. ${jsonResponseInstruction()}`
         },
         {
           role: "user",
           content: `Course page text:\n${text.slice(0, 9000)}\n\nReturn JSON with keys: shortSummary, description, learningOutcomes, prerequisites, teachingMethods, audience, keywords. Focus on what a PhD student needs to decide whether the course is relevant.`
         }
       ],
-      { maxTokens: 1100 }
+      { maxTokens: COURSE_SUMMARY_MAX_TOKENS }
     );
     const summary = normalizeCourseSummary(parseJsonFromModel(content), course);
     cache.entries[key] = { generatedAt: new Date().toISOString(), summary };
@@ -598,12 +613,47 @@ function hfToken() {
   return process.env.HF_TOKEN || process.env.HUGGINGFACE_HUB_TOKEN || "";
 }
 
+function llmToken() {
+  return LLM_API_KEY || hfToken();
+}
+
+function isLocalEndpoint(endpoint = "") {
+  return endpoint.startsWith("http://localhost") || endpoint.startsWith("http://127.0.0.1");
+}
+
+function llmHeaders() {
+  const token = llmToken();
+  return token ? { authorization: `Bearer ${token}` } : {};
+}
+
+function embeddingHeaders() {
+  const token = EMBEDDING_API_KEY || hfToken();
+  return token ? { authorization: `Bearer ${token}` } : {};
+}
+
+function isOpenAiEmbeddingEndpoint() {
+  return new URL(EMBEDDING_ENDPOINT).pathname.includes("/v1/embeddings");
+}
+
+function jsonResponseInstruction() {
+  if (["off", "false", "0", "no"].includes(LLM_JSON_THINKING_MODE)) {
+    return "Return only valid JSON. Do not include chain-of-thought. /no_think";
+  }
+  return "Return only valid JSON.";
+}
+
 function embeddingEnabled() {
-  return Boolean(hfToken()) && process.env.RECOMMENDER_MODE !== "lexical";
+  const hasEmbeddingAccess =
+    Boolean(EMBEDDING_API_KEY || hfToken()) || isLocalEndpoint(EMBEDDING_ENDPOINT);
+  return hasEmbeddingAccess && process.env.RECOMMENDER_MODE !== "lexical";
 }
 
 function reasoningEnabled() {
-  return Boolean(hfToken()) && process.env.REASONING_MODE !== "off";
+  return (Boolean(llmToken()) || isLocalEndpoint(HF_CHAT_ENDPOINT)) && process.env.REASONING_MODE !== "off";
+}
+
+function llmRerankEnabled() {
+  return reasoningEnabled() && process.env.LLM_RERANK_MODE !== "off";
 }
 
 function profileToEmbeddingText(profile = {}) {
@@ -657,8 +707,14 @@ function averageVectors(vectors) {
 }
 
 function normalizeEmbeddingOutput(output, expectedCount) {
+  if (output && Array.isArray(output.data)) {
+    return output.data
+      .slice()
+      .sort((a, b) => (a.index || 0) - (b.index || 0))
+      .map((row) => row.embedding.map(Number));
+  }
   if (!Array.isArray(output)) {
-    throw new Error("Unexpected Hugging Face embedding response.");
+    throw new Error("Unexpected embedding response.");
   }
   if (typeof output[0] === "number") return [output.map(Number)];
   if (Array.isArray(output[0]) && typeof output[0][0] === "number") {
@@ -670,35 +726,50 @@ function normalizeEmbeddingOutput(output, expectedCount) {
   if (Array.isArray(output[0]) && Array.isArray(output[0][0])) {
     return output.map((tokenVectors) => averageVectors(tokenVectors));
   }
-  throw new Error("Unsupported Hugging Face embedding response shape.");
+  throw new Error("Unsupported embedding response shape.");
 }
 
-async function fetchEmbeddingsFromHuggingFace(texts) {
-  const response = await fetch(HF_FEATURE_ENDPOINT, {
+function embeddingRequestBody(texts) {
+  if (isOpenAiEmbeddingEndpoint()) {
+    return {
+      model: HF_EMBEDDING_MODEL,
+      input: texts
+    };
+  }
+  return {
+    inputs: texts,
+    options: { wait_for_model: true }
+  };
+}
+
+async function fetchEmbeddings(texts) {
+  const response = await fetch(EMBEDDING_ENDPOINT, {
     method: "POST",
     headers: {
-      authorization: `Bearer ${hfToken()}`,
+      ...embeddingHeaders(),
       "content-type": "application/json"
     },
-    body: JSON.stringify({
-      inputs: texts,
-      options: { wait_for_model: true }
-    })
+    body: JSON.stringify(embeddingRequestBody(texts))
   });
   const payload = await response.json();
   if (!response.ok || payload.error) {
-    throw new Error(payload.error || `Hugging Face request failed: ${response.status}`);
+    throw new Error(payload.error?.message || payload.error || `Embedding request failed: ${response.status}`);
   }
-  return normalizeEmbeddingOutput(payload, texts.length);
+  const vectors = normalizeEmbeddingOutput(payload, texts.length);
+  if (vectors.length !== texts.length) {
+    throw new Error(`Embedding endpoint returned ${vectors.length} vectors for ${texts.length} inputs`);
+  }
+  return vectors;
 }
 
 async function getEmbeddings(items) {
+  const embeddingCacheKey = `${HF_EMBEDDING_MODEL}:${EMBEDDING_ENDPOINT}`;
   const cache = await readJson(EMBEDDING_CACHE, {
-    model: HF_EMBEDDING_MODEL,
+    model: embeddingCacheKey,
     vectors: {}
   });
-  if (cache.model !== HF_EMBEDDING_MODEL) {
-    cache.model = HF_EMBEDDING_MODEL;
+  if (cache.model !== embeddingCacheKey) {
+    cache.model = embeddingCacheKey;
     cache.vectors = {};
   }
 
@@ -716,7 +787,7 @@ async function getEmbeddings(items) {
 
   for (let index = 0; index < missing.length; index += 8) {
     const batch = missing.slice(index, index + 8);
-    const vectors = await fetchEmbeddingsFromHuggingFace(batch.map((item) => item.text));
+    const vectors = await fetchEmbeddings(batch.map((item) => item.text));
     vectors.forEach((vector, vectorIndex) => {
       const item = batch[vectorIndex];
       cache.vectors[item.key] = vector;
@@ -726,6 +797,63 @@ async function getEmbeddings(items) {
 
   if (missing.length) await writeJson(EMBEDDING_CACHE, cache);
   return results;
+}
+
+async function checkModelEndpoints() {
+  const report = {
+    embedding: {
+      enabled: embeddingEnabled(),
+      model: embeddingEnabled() ? HF_EMBEDDING_MODEL : null,
+      endpoint: EMBEDDING_ENDPOINT
+    },
+    reasoning: {
+      enabled: reasoningEnabled(),
+      model: reasoningEnabled() ? HF_REASONING_MODEL : null,
+      endpoint: HF_CHAT_ENDPOINT
+    }
+  };
+
+  if (embeddingEnabled()) {
+    try {
+      const vectors = await fetchEmbeddings([
+        "PhD student researching machine learning for healthcare",
+        "Course about biostatistics, causal inference, and clinical data"
+      ]);
+      report.embedding = {
+        ...report.embedding,
+        ok: vectors.length === 2 && vectors.every((vector) => vector.length),
+        count: vectors.length,
+        dimensions: vectors[0]?.length || 0,
+        sampleCosine: Number(cosineSimilarity(vectors[0], vectors[1]).toFixed(4))
+      };
+    } catch (error) {
+      report.embedding = { ...report.embedding, ok: false, error: error.message };
+    }
+  }
+
+  if (reasoningEnabled()) {
+    try {
+      const content = await callReasoningModel(
+        [
+          {
+            role: "system",
+            content: `You are checking a JSON-only API integration. ${jsonResponseInstruction()}`
+          },
+          {
+            role: "user",
+            content: 'Return exactly this JSON shape: {"ok":true,"modelUse":"reasoning-check"}.'
+          }
+        ],
+        { maxTokens: 200 }
+      );
+      const parsed = parseJsonFromModel(content);
+      report.reasoning = { ...report.reasoning, ok: Boolean(parsed.ok), response: parsed };
+    } catch (error) {
+      report.reasoning = { ...report.reasoning, ok: false, error: error.message };
+    }
+  }
+
+  return report;
 }
 
 function cosineSimilarity(a = [], b = []) {
@@ -778,7 +906,7 @@ async function callReasoningModel(messages, { maxTokens = 900 } = {}) {
   const response = await fetch(HF_CHAT_ENDPOINT, {
     method: "POST",
     headers: {
-      authorization: `Bearer ${hfToken()}`,
+      ...llmHeaders(),
       "content-type": "application/json"
     },
     body: JSON.stringify({
@@ -791,7 +919,7 @@ async function callReasoningModel(messages, { maxTokens = 900 } = {}) {
   });
   const payload = await response.json();
   if (!response.ok || payload.error) {
-    throw new Error(payload.error?.message || payload.error || `Hugging Face chat failed: ${response.status}`);
+    throw new Error(payload.error?.message || payload.error || `Reasoning chat failed: ${response.status}`);
   }
   return payload.choices?.[0]?.message?.content || "";
 }
@@ -814,13 +942,13 @@ async function getProfileInsights(profile = {}) {
       {
         role: "system",
         content:
-          "You are a PhD course recommendation analyst for Danish universities. Expand a student's profile into useful course-search concepts. Return only valid JSON."
+          `You are a PhD course recommendation analyst for Danish universities. Expand a student's profile into useful course-search concepts. ${jsonResponseInstruction()}`
       },
       {
         role: "user",
         content: `Student profile:\n${profileText}\n\nReturn JSON with keys: inferredSubjects, adjacentSubjects, methods, searchKeywords, genericSkills, rationale. Use concise academic terms, methods, and course subjects that may be relevant even if the student did not mention them explicitly.`
       }
-    ]);
+    ], { maxTokens: PROFILE_INSIGHTS_MAX_TOKENS });
     const insights = normalizeProfileInsights(parseJsonFromModel(content));
     cache.entries[key] = {
       model: HF_REASONING_MODEL,
@@ -1006,7 +1134,12 @@ function recommendCourses(profile, courses, limit = 8) {
     .slice(0, limit);
 }
 
-async function recommendCoursesWithEmbeddings(profile, courses, limit = 8) {
+async function retrieveSemanticCandidates(
+  profile,
+  courses,
+  candidateLimit = SEMANTIC_CANDIDATE_LIMIT,
+  threshold = SEMANTIC_CANDIDATE_THRESHOLD
+) {
   const upcomingCourses = courses
     .filter(isUpcomingCourse)
     .filter((course) => courseAllowedByProfile(profile, course));
@@ -1023,7 +1156,7 @@ async function recommendCoursesWithEmbeddings(profile, courses, limit = 8) {
   ]);
   const profileVector = embeddings.get("profile");
 
-  return upcomingCourses
+  const ranked = upcomingCourses
     .map((course) => {
       const lexical = lexicalById.get(course.id);
       const similarity = cosineSimilarity(profileVector, embeddings.get(course.id));
@@ -1038,16 +1171,185 @@ async function recommendCoursesWithEmbeddings(profile, courses, limit = 8) {
       return {
         ...course,
         score,
+        retrievalScore: score,
+        semanticSimilarity: Number(similarity.toFixed(4)),
         semanticScore: Number(semanticScore.toFixed(2)),
         lexicalScore,
-        recommender: "hugging-face-embeddings",
+        recommender: "semantic-embeddings",
         reasons,
         summary: buildCourseSummary(course, profile)
       };
     })
-    .filter((course) => course.score > 0)
-    .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title))
-    .slice(0, limit);
+    .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title));
+
+  if (threshold < 0) return ranked.slice(0, candidateLimit);
+
+  const aboveThreshold = ranked.filter((course) => course.semanticSimilarity >= threshold);
+  const minimumCandidates = Math.min(10, candidateLimit, ranked.length);
+  if (aboveThreshold.length < minimumCandidates) {
+    return ranked.slice(0, candidateLimit);
+  }
+  return aboveThreshold.slice(0, candidateLimit);
+}
+
+function compactCourseForLlm(course = {}) {
+  const summary = course.courseSummary || {};
+  return {
+    courseId: course.id,
+    title: course.title,
+    university: course.university,
+    phdSchool: course.phdSchool,
+    ects: course.ects,
+    dates: course.startDate,
+    city: course.city,
+    semanticSimilarity: course.semanticSimilarity,
+    retrievalScore: course.retrievalScore || course.score,
+    shortSummary: summary.shortSummary || course.description || "",
+    description: summarize(summary.description || course.description || "", 650),
+    learningOutcomes: summary.learningOutcomes || [],
+    prerequisites: summary.prerequisites || "",
+    teachingMethods: summary.teachingMethods || "",
+    audience: summary.audience || "",
+    keywords: summary.keywords || []
+  };
+}
+
+function userInterestSummary(profile = {}, insights = null) {
+  return {
+    profileText: profileToEmbeddingText(profile),
+    researchArea: profile.area || "",
+    studyProgram: profile.studyProgram || "",
+    researchDirection: profile.researchDirection || "",
+    interests: profile.interests || "",
+    projectTopic: profile.topic || "",
+    methodsAndKeywords: profile.keywords || profile.methods || "",
+    preferredUniversities: selectedUniversities(profile),
+    ownPhdSchool: profile.school || "",
+    includeOtherSchools: Boolean(profile.includeOtherSchools),
+    allowedOtherSchools: profile.allowedOtherSchools || [],
+    llmInsights: insights || {}
+  };
+}
+
+function normalizeRerankDecisions(raw = {}, candidates = []) {
+  const byId = new Map(candidates.map((course) => [String(course.id), course]));
+  const decisions = Array.isArray(raw.decisions) ? raw.decisions : [];
+  const normalized = [];
+  const seen = new Set();
+
+  for (const item of decisions) {
+    const course = byId.get(String(item.courseId));
+    if (!course) continue;
+    seen.add(String(course.id));
+    const llmScore = Math.max(0, Math.min(100, Number(item.score || 0)));
+    const decision = ["recommend", "maybe", "exclude"].includes(String(item.decision).toLowerCase())
+      ? String(item.decision).toLowerCase()
+      : "maybe";
+    normalized.push({
+      ...course,
+      score: llmScore,
+      llmScore,
+      llmDecision: decision,
+      fitType: summarize(item.fitType || "", 80),
+      llmReason: summarize(item.reason || "", 260),
+      reasons: [
+        `LLM decision: ${decision} (${llmScore}/100)`,
+        ...(item.reason ? [summarize(item.reason, 220)] : []),
+        ...(course.reasons || [])
+      ]
+    });
+  }
+
+  for (const course of candidates) {
+    if (!seen.has(String(course.id))) {
+      normalized.push({ ...course, llmDecision: "maybe", llmScore: course.score || 0 });
+    }
+  }
+
+  return normalized;
+}
+
+async function rerankCandidateChunk(profile, insights, candidates, chunkIndex) {
+  const summary = userInterestSummary(profile, insights);
+  const compactCourses = candidates.map((course) => compactCourseForLlm(course));
+  const cachePayload = JSON.stringify({ user: summary, courses: compactCourses });
+  const cache = await readJson(LLM_INSIGHTS_CACHE, { entries: {} });
+  const key = `course-rerank:${HF_REASONING_MODEL}:${hashText(cachePayload)}`;
+  const cached = cache.entries[key];
+  if (cached) return normalizeRerankDecisions(cached.raw, candidates);
+
+  const content = await callReasoningModel(
+    [
+      {
+        role: "system",
+        content:
+          `You are a careful PhD course recommender. You judge whether retrieved course summaries are genuinely useful for a student's research direction. ${jsonResponseInstruction()}`
+      },
+      {
+        role: "user",
+        content:
+          `User interest summary:\n${JSON.stringify(summary, null, 2)}\n\n` +
+          `Candidate course chunk ${chunkIndex}:\n${JSON.stringify(compactCourses, null, 2)}\n\n` +
+          "For each course, decide if it should be recommended. Prefer courses that support the research direction, methods, theory, or important adjacent skills. Do not reward a course only because it is from a preferred university; those preferences were already used as filters. Return JSON exactly like: " +
+          '{"decisions":[{"courseId":"...","decision":"recommend|maybe|exclude","score":0-100,"fitType":"core|method|adjacent|generic|not_relevant","reason":"short reason"}]}'
+      }
+    ],
+    { maxTokens: LLM_RERANK_MAX_TOKENS }
+  );
+  const raw = parseJsonFromModel(content);
+  cache.entries[key] = { generatedAt: new Date().toISOString(), raw };
+  await writeJson(LLM_INSIGHTS_CACHE, cache);
+  return normalizeRerankDecisions(raw, candidates);
+}
+
+async function finalRerankWithLlm(profile, insights, candidates, limit) {
+  if (candidates.length <= limit || process.env.LLM_RERANK_FINAL_PASS === "false") {
+    return candidates.slice(0, limit);
+  }
+  const finalists = candidates.slice(0, LLM_RERANK_FINALIST_LIMIT);
+  try {
+    const decisions = await rerankCandidateChunk(profile, insights, finalists, 999);
+    const recommended = decisions.filter((course) => course.llmDecision !== "exclude");
+    if (!recommended.length) return candidates.slice(0, limit);
+    return recommended
+      .sort(
+        (a, b) =>
+          (b.llmScore || b.score || 0) - (a.llmScore || a.score || 0) ||
+          (b.retrievalScore || 0) - (a.retrievalScore || 0) ||
+          a.title.localeCompare(b.title)
+      )
+      .slice(0, limit);
+  } catch {
+    return candidates.slice(0, limit);
+  }
+}
+
+async function rerankCandidatesWithLlm(profile, insights, candidates, limit = 8) {
+  if (!llmRerankEnabled()) return candidates.slice(0, limit);
+
+  const decisions = [];
+  for (let start = 0; start < candidates.length; start += LLM_RERANK_CHUNK_SIZE) {
+    const chunk = candidates.slice(start, start + LLM_RERANK_CHUNK_SIZE);
+    try {
+      decisions.push(
+        ...(await rerankCandidateChunk(profile, insights, chunk, start / LLM_RERANK_CHUNK_SIZE + 1))
+      );
+    } catch (error) {
+      console.warn("LLM rerank chunk failed:", error.message);
+      decisions.push(...chunk);
+    }
+  }
+
+  const recommended = decisions
+    .filter((course) => course.llmDecision !== "exclude")
+    .sort(
+      (a, b) =>
+        (b.llmScore || b.score || 0) - (a.llmScore || a.score || 0) ||
+        (b.retrievalScore || 0) - (a.retrievalScore || 0) ||
+        a.title.localeCompare(b.title)
+    );
+  if (!recommended.length) return candidates.slice(0, limit);
+  return finalRerankWithLlm(profile, insights, recommended, limit);
 }
 
 async function createRecommendations(profile, courses, limit = 8) {
@@ -1065,12 +1367,26 @@ async function createRecommendations(profile, courses, limit = 8) {
   }
 
   try {
+    const candidates = await retrieveSemanticCandidates(
+      augmentedProfile,
+      courses,
+      SEMANTIC_CANDIDATE_LIMIT,
+      SEMANTIC_CANDIDATE_THRESHOLD
+    );
+    const recommendations = await rerankCandidatesWithLlm(
+      augmentedProfile,
+      reasoning.insights,
+      candidates,
+      limit
+    );
     return {
-      mode: "semantic",
+      mode: llmRerankEnabled() ? "semantic-llm-rerank" : "semantic",
       model: HF_EMBEDDING_MODEL,
+      rerankerModel: llmRerankEnabled() ? HF_REASONING_MODEL : null,
+      candidateCount: candidates.length,
       reasoning,
       augmentedProfile,
-      recommendations: await recommendCoursesWithEmbeddings(augmentedProfile, courses, limit)
+      recommendations
     };
   } catch (error) {
     console.warn("Semantic recommendations failed, using lexical fallback:", error.message);
@@ -1304,13 +1620,13 @@ async function reasonAboutCluster(cluster) {
       {
         role: "system",
         content:
-          "You are optimizing course recommendations for clusters of PhD students. Return only valid JSON."
+          `You are optimizing course recommendations for clusters of PhD students. ${jsonResponseInstruction()}`
       },
       {
         role: "user",
         content: `Cluster data:\n${clusterText}\n\nReturn JSON with keys: label, expandedThemes, searchKeywords, courseCategories, digestStrategy. Infer adjacent course areas that may help this cluster beyond their exact wording.`
       }
-    ]);
+    ], { maxTokens: CLUSTER_INSIGHTS_MAX_TOKENS });
     const insight = normalizeClusterInsight(parseJsonFromModel(content));
     cache.entries[key] = {
       model: HF_REASONING_MODEL,
@@ -1434,8 +1750,9 @@ async function handleApi(request, response, url) {
       phdSchools: getPhdSchoolsFromCourses(cache.courses),
       fields: Object.keys(FIELD_KEYWORDS),
       recommender: {
-        mode: embeddingEnabled() ? "semantic" : "lexical",
+        mode: embeddingEnabled() ? (llmRerankEnabled() ? "semantic-llm-rerank" : "semantic") : "lexical",
         model: embeddingEnabled() ? HF_EMBEDDING_MODEL : null,
+        rerankerModel: llmRerankEnabled() ? HF_REASONING_MODEL : null,
         semanticEnabled: embeddingEnabled()
       },
       reasoning: {
@@ -1477,6 +1794,8 @@ async function handleApi(request, response, url) {
       recommender: {
         mode: recommendationResult.mode,
         model: recommendationResult.model,
+        rerankerModel: recommendationResult.rerankerModel,
+        candidateCount: recommendationResult.candidateCount,
         warning: recommendationResult.warning
       },
       reasoning: {
@@ -1561,6 +1880,11 @@ async function main() {
   if (process.argv.includes("--scrape-once")) {
     const cache = await scrapeCourses();
     console.log(`Scraped ${cache.count} courses from ${cache.totalPages} pages.`);
+    return;
+  }
+
+  if (process.argv.includes("--check-models")) {
+    console.log(JSON.stringify(await checkModelEndpoints(), null, 2));
     return;
   }
 

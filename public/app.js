@@ -93,12 +93,15 @@ function updateRecommender(recommender) {
       : recommender?.mode === "lexical-fallback"
         ? "Fallback"
         : "Lexical";
-  recommenderMode.title = recommender?.model || "Set HF_TOKEN to enable Hugging Face embeddings";
+  recommenderMode.title =
+    [recommender?.model, recommender?.rerankerModel && `reranker: ${recommender.rerankerModel}`]
+      .filter(Boolean)
+      .join(" · ") || "Set HF_TOKEN or EMBEDDING_ENDPOINT to enable semantic embeddings";
 }
 
 function updateReasoning(reasoning) {
   reasoningMode.textContent = reasoning?.enabled || reasoning?.mode ? "On" : "Off";
-  reasoningMode.title = reasoning?.model || "Set HF_TOKEN to enable Hugging Face reasoning";
+  reasoningMode.title = reasoning?.model || "Set HF_TOKEN or LLM_CHAT_ENDPOINT to enable reasoning";
 }
 
 function renderInsights(reasoning) {

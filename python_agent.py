@@ -46,12 +46,14 @@ SOURCE_BASE = "https://phdcourses.dk"
 USER_AGENT = "Danish PhD Course Recommendation Agent Python/0.1"
 PORT = int(os.getenv("PORT", "3000"))
 HF_EMBEDDING_MODEL = os.getenv(
-    "HF_EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    "HF_EMBEDDING_MODEL", "BAAI/bge-m3"
 )
 HF_REASONING_MODEL = os.getenv("HF_REASONING_MODEL", "Qwen/Qwen3-14B")
 HF_FEATURE_ENDPOINT = (
     f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL}"
 )
+EMBEDDING_ENDPOINT = os.getenv("EMBEDDING_ENDPOINT", HF_FEATURE_ENDPOINT)
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
 HF_CHAT_ENDPOINT = os.getenv("LLM_CHAT_ENDPOINT", "https://router.huggingface.co/v1/chat/completions")
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 REASONING_REFRESH_DAYS = int(os.getenv("REASONING_REFRESH_DAYS", "21"))
@@ -62,6 +64,7 @@ LLM_RERANK_FINALIST_LIMIT = int(os.getenv("LLM_RERANK_FINALIST_LIMIT", "20"))
 PROFILE_INSIGHTS_MAX_TOKENS = int(os.getenv("PROFILE_INSIGHTS_MAX_TOKENS", "1200"))
 COURSE_SUMMARY_MAX_TOKENS = int(os.getenv("COURSE_SUMMARY_MAX_TOKENS", "1400"))
 LLM_RERANK_MAX_TOKENS = int(os.getenv("LLM_RERANK_MAX_TOKENS", "2200"))
+CLUSTER_INSIGHTS_MAX_TOKENS = int(os.getenv("CLUSTER_INSIGHTS_MAX_TOKENS", "1800"))
 LLM_JSON_THINKING_MODE = os.getenv("LLM_JSON_THINKING_MODE", "off").lower()
 
 
@@ -601,9 +604,22 @@ def local_llm_endpoint() -> bool:
     return HF_CHAT_ENDPOINT.startswith(("http://localhost", "http://127.0.0.1"))
 
 
+def local_embedding_endpoint() -> bool:
+    return EMBEDDING_ENDPOINT.startswith(("http://localhost", "http://127.0.0.1"))
+
+
 def llm_headers() -> dict[str, str]:
     token = llm_token()
     return {"authorization": f"Bearer {token}"} if token else {}
+
+
+def embedding_headers() -> dict[str, str]:
+    token = EMBEDDING_API_KEY or hf_token()
+    return {"authorization": f"Bearer {token}"} if token else {}
+
+
+def openai_embedding_endpoint() -> bool:
+    return "/v1/embeddings" in urlparse(EMBEDDING_ENDPOINT).path
 
 
 def json_response_instruction() -> str:
@@ -617,7 +633,8 @@ def reasoning_enabled() -> bool:
 
 
 def embedding_enabled() -> bool:
-    return bool(hf_token()) and os.getenv("RECOMMENDER_MODE") != "lexical"
+    has_embedding_access = bool(EMBEDDING_API_KEY or hf_token()) or local_embedding_endpoint()
+    return has_embedding_access and os.getenv("RECOMMENDER_MODE") != "lexical"
 
 
 def llm_rerank_enabled() -> bool:
@@ -905,6 +922,9 @@ def average_vectors(vectors: list[list[float]]) -> list[float]:
 
 
 def normalize_embedding_output(output: Any, expected_count: int) -> list[list[float]]:
+    if isinstance(output, dict) and isinstance(output.get("data"), list):
+        rows = sorted(output["data"], key=lambda item: item.get("index", 0))
+        return [[float(value) for value in row["embedding"]] for row in rows]
     if isinstance(output, list) and output and isinstance(output[0], (int, float)):
         return [[float(value) for value in output]]
     if isinstance(output, list) and output and isinstance(output[0], list):
@@ -917,10 +937,18 @@ def normalize_embedding_output(output: Any, expected_count: int) -> list[list[fl
     raise RuntimeError("Unsupported embedding response shape")
 
 
+def embedding_request_body(batch: list[dict[str, str]]) -> dict[str, Any]:
+    texts = [item["text"] for item in batch]
+    if openai_embedding_endpoint():
+        return {"model": HF_EMBEDDING_MODEL, "input": texts}
+    return {"inputs": texts, "options": {"wait_for_model": True}}
+
+
 def get_embeddings(items: list[dict[str, str]]) -> dict[str, list[float]]:
-    cache = read_json(EMBEDDING_CACHE, {"model": HF_EMBEDDING_MODEL, "vectors": {}})
-    if cache.get("model") != HF_EMBEDDING_MODEL:
-        cache = {"model": HF_EMBEDDING_MODEL, "vectors": {}}
+    embedding_cache_key = f"{HF_EMBEDDING_MODEL}:{EMBEDDING_ENDPOINT}"
+    cache = read_json(EMBEDDING_CACHE, {"model": embedding_cache_key, "vectors": {}})
+    if cache.get("model") != embedding_cache_key:
+        cache = {"model": embedding_cache_key, "vectors": {}}
 
     results = {}
     missing = []
@@ -934,11 +962,13 @@ def get_embeddings(items: list[dict[str, str]]) -> dict[str, list[float]]:
     for start in range(0, len(missing), 8):
         batch = missing[start : start + 8]
         payload = post_json(
-            HF_FEATURE_ENDPOINT,
-            {"inputs": [item["text"] for item in batch], "options": {"wait_for_model": True}},
-            {"authorization": f"Bearer {hf_token()}"},
+            EMBEDDING_ENDPOINT,
+            embedding_request_body(batch),
+            embedding_headers(),
         )
         vectors = normalize_embedding_output(payload, len(batch))
+        if len(vectors) != len(batch):
+            raise RuntimeError(f"Embedding endpoint returned {len(vectors)} vectors for {len(batch)} inputs")
         for item, vector in zip(batch, vectors):
             cache["vectors"][item["key"]] = vector
             results[item["id"]] = vector
@@ -946,6 +976,65 @@ def get_embeddings(items: list[dict[str, str]]) -> dict[str, list[float]]:
     if missing:
         write_json(EMBEDDING_CACHE, cache)
     return results
+
+
+def check_model_endpoints() -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "embedding": {
+            "enabled": embedding_enabled(),
+            "model": HF_EMBEDDING_MODEL if embedding_enabled() else None,
+            "endpoint": EMBEDDING_ENDPOINT,
+        },
+        "reasoning": {
+            "enabled": reasoning_enabled(),
+            "model": HF_REASONING_MODEL if reasoning_enabled() else None,
+            "endpoint": HF_CHAT_ENDPOINT,
+        },
+    }
+
+    if embedding_enabled():
+        try:
+            batch = [
+                {"id": "query", "text": "PhD student researching machine learning for healthcare"},
+                {"id": "course", "text": "Course about biostatistics, causal inference, and clinical data"},
+            ]
+            payload = post_json(EMBEDDING_ENDPOINT, embedding_request_body(batch), embedding_headers())
+            vectors = normalize_embedding_output(payload, len(batch))
+            report["embedding"].update(
+                {
+                    "ok": len(vectors) == len(batch) and all(vectors),
+                    "count": len(vectors),
+                    "dimensions": len(vectors[0]) if vectors else 0,
+                    "sampleCosine": round(cosine(vectors[0], vectors[1]), 4) if len(vectors) == 2 else None,
+                }
+            )
+        except Exception as error:
+            report["embedding"].update({"ok": False, "error": str(error)})
+
+    if reasoning_enabled():
+        try:
+            content = call_reasoning_llm(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are checking a JSON-only API integration. "
+                            f"{json_response_instruction()}"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": 'Return exactly this JSON shape: {"ok":true,"modelUse":"reasoning-check"}.',
+                    },
+                ],
+                max_tokens=200,
+            )
+            parsed = parse_model_json(content)
+            report["reasoning"].update({"ok": bool(parsed.get("ok")), "response": parsed})
+        except Exception as error:
+            report["reasoning"].update({"ok": False, "error": str(error)})
+
+    return report
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -1232,6 +1321,82 @@ def cluster_terms(profiles: list[dict[str, Any]]) -> list[str]:
     return [term for term, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:8]]
 
 
+def cluster_insights_with_llm(clusters: list[dict[str, Any]]) -> dict[str, Any]:
+    if not reasoning_enabled() or os.getenv("CLUSTER_REASONING_MODE", "on") == "off" or not clusters:
+        return {"mode": "disabled", "model": None, "insights": []}
+
+    compact_clusters = [
+        {
+            "id": cluster["id"],
+            "size": cluster["size"],
+            "themes": cluster["themes"],
+            "profiles": [
+                {
+                    "area": user.get("area", ""),
+                    "studyProgram": user.get("studyProgram", ""),
+                    "researchDirection": summarize(user.get("researchDirection", ""), 260),
+                    "interests": summarize(user.get("interests", ""), 260),
+                }
+                for user in cluster.get("users", [])[:12]
+            ],
+        }
+        for cluster in clusters
+    ]
+    text = json.dumps(compact_clusters, sort_keys=True, ensure_ascii=False)
+    cache = read_json(LLM_INSIGHTS_CACHE, {"entries": {}})
+    key = f"clusters:{HF_REASONING_MODEL}:{sha_key(text)}"
+    cached = cache["entries"].get(key)
+    if cached:
+        try:
+            age_days = (time.time() - datetime.fromisoformat(cached["generatedAt"]).timestamp()) / 86400
+        except (KeyError, ValueError):
+            age_days = REASONING_REFRESH_DAYS + 1
+        if age_days < REASONING_REFRESH_DAYS:
+            return {"mode": "cached", "model": HF_REASONING_MODEL, "insights": cached["insights"]}
+
+    try:
+        content = call_reasoning_llm(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You help optimize PhD course recommendations by labeling groups of "
+                        "similar subscribers. Do not use email addresses or personal identifiers. "
+                        f"{json_response_instruction()}"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Subscriber clusters:\n"
+                        f"{json.dumps(compact_clusters, ensure_ascii=False, indent=2)}\n\n"
+                        "Return JSON with key clusters. Each item must include: clusterId, label, "
+                        "sharedNeeds, searchKeywords, usefulCourseTypes, digestStrategy."
+                    ),
+                },
+            ],
+            max_tokens=CLUSTER_INSIGHTS_MAX_TOKENS,
+        )
+        raw = parse_model_json(content)
+        insights = []
+        for item in raw.get("clusters", []):
+            insights.append(
+                {
+                    "clusterId": str(item.get("clusterId", "")),
+                    "label": summarize(str(item.get("label", "")), 120),
+                    "sharedNeeds": clean_list(item.get("sharedNeeds"), 8),
+                    "searchKeywords": clean_list(item.get("searchKeywords"), 14),
+                    "usefulCourseTypes": clean_list(item.get("usefulCourseTypes"), 8),
+                    "digestStrategy": summarize(str(item.get("digestStrategy", "")), 360),
+                }
+            )
+        cache["entries"][key] = {"generatedAt": now_iso(), "insights": insights}
+        write_json(LLM_INSIGHTS_CACHE, cache)
+        return {"mode": "fresh", "model": HF_REASONING_MODEL, "insights": insights}
+    except Exception as error:
+        return {"mode": "fallback", "model": HF_REASONING_MODEL, "warning": str(error), "insights": []}
+
+
 def cluster_subscribers() -> dict[str, Any]:
     subscribers = [item for item in read_json(SUBSCRIBERS_FILE, []) if item.get("active")]
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -1260,14 +1425,19 @@ def cluster_subscribers() -> dict[str, Any]:
                 ],
             }
         )
+    reasoning = cluster_insights_with_llm(clusters)
+    insights_by_id = {item.get("clusterId"): item for item in reasoning.get("insights", [])}
+    enhanced_clusters = [{**cluster, "llmInsights": insights_by_id.get(cluster["id"])} for cluster in clusters]
     return {
-        "mode": "profile-field",
-        "model": None,
+        "mode": "profile-field-llm-labeled" if reasoning.get("insights") else "profile-field",
+        "model": HF_REASONING_MODEL if reasoning.get("insights") else None,
         "reasoning": {
             "enabled": reasoning_enabled(),
             "model": HF_REASONING_MODEL if reasoning_enabled() else None,
+            "clusterMode": reasoning.get("mode"),
+            "warning": reasoning.get("warning"),
         },
-        "clusters": clusters,
+        "clusters": enhanced_clusters,
     }
 
 
@@ -1382,6 +1552,10 @@ class AgentHandler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     ensure_dirs()
+    if "--check-models" in os.sys.argv:
+        print(json.dumps(check_model_endpoints(), indent=2, ensure_ascii=False))
+        return
+
     if "--scrape-once" in os.sys.argv:
         cache = scrape_courses(max_pages=int(os.getenv("MAX_SCRAPE_PAGES", "120")))
         print(f"Scraped {cache['count']} courses from {cache['totalPages']} pages.")
