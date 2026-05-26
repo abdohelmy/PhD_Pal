@@ -71,7 +71,7 @@ Then run the server or `node server.mjs --digest-once`.
 
 ## Hugging Face Semantic Recommendations
 
-Set a Hugging Face token to enable LLM reasoning and semantic matching:
+Set a Hugging Face token to enable hosted LLM reasoning and semantic matching:
 
 ```sh
 HF_TOKEN=hf_...
@@ -81,12 +81,39 @@ Default models:
 
 ```sh
 HF_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-HF_REASONING_MODEL=deepseek-ai/DeepSeek-R1:fastest
+HF_REASONING_MODEL=Qwen/Qwen3-14B
 ```
 
-The reasoning model uses Hugging Face's OpenAI-compatible chat completions router. It expands user profiles every few weeks by default, summarizes full course detail pages, and caches those results in `data/llm-insights.json`.
+By default, the reasoning model uses Hugging Face's OpenAI-compatible chat completions router. It expands user profiles every few weeks by default, summarizes full course detail pages, and caches those results in `data/llm-insights.json`.
 
 Embeddings are cached in `data/embeddings.json`.
+
+### Local 14B Reasoning Model
+
+With a 40 GB GPU, run the reasoning model locally behind an OpenAI-compatible server such as vLLM or SGLang. A good default for this app is `Qwen/Qwen3-14B` because it supports both thinking and non-thinking modes, has a native 32k context window, and follows structured prompts well.
+
+Example vLLM server:
+
+```sh
+vllm serve Qwen/Qwen3-14B --dtype auto --max-model-len 32768 --gpu-memory-utilization 0.90
+```
+
+Then point the Python app at it:
+
+```sh
+LLM_CHAT_ENDPOINT=http://localhost:8000/v1/chat/completions \
+HF_REASONING_MODEL=Qwen/Qwen3-14B \
+python3 python_agent.py
+```
+
+For JSON tasks, the app defaults to asking Qwen-style models not to emit thinking text. If you want explicit thinking mode, increase the output budgets and set:
+
+```sh
+LLM_JSON_THINKING_MODE=on
+PROFILE_INSIGHTS_MAX_TOKENS=2000
+COURSE_SUMMARY_MAX_TOKENS=2200
+LLM_RERANK_MAX_TOKENS=4000
+```
 
 To force the original local matcher:
 
@@ -122,7 +149,7 @@ Those stored summaries are used for recommendation ranking and embeddings.
 
 ## LLM Reranking After Semantic Retrieval
 
-When `HF_TOKEN` is set, the Python backend uses a two-stage recommendation pipeline:
+When embeddings are enabled, the Python backend uses a two-stage recommendation pipeline:
 
 1. Use embeddings to retrieve a generous candidate set from the saved course summaries.
 2. Split those candidate courses into chunks of 5-10.
@@ -137,6 +164,9 @@ SEMANTIC_CANDIDATE_THRESHOLD=0.25
 LLM_RERANK_CHUNK_SIZE=8
 LLM_RERANK_FINAL_PASS=true
 LLM_RERANK_MODE=on
+PROFILE_INSIGHTS_MAX_TOKENS=1200
+COURSE_SUMMARY_MAX_TOKENS=1400
+LLM_RERANK_MAX_TOKENS=2200
 ```
 
 Set `LLM_RERANK_MODE=off` to use semantic similarity without the LLM reranker.

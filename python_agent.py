@@ -8,6 +8,9 @@ Run:
 Optional Hugging Face support:
     HF_TOKEN=hf_... python3 python_agent.py
 
+Optional local LLM support:
+    LLM_CHAT_ENDPOINT=http://localhost:8000/v1/chat/completions python3 python_agent.py
+
 The code intentionally uses only the Python standard library so it is easier to
 read, copy, and modify while learning.
 """
@@ -45,16 +48,21 @@ PORT = int(os.getenv("PORT", "3000"))
 HF_EMBEDDING_MODEL = os.getenv(
     "HF_EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
-HF_REASONING_MODEL = os.getenv("HF_REASONING_MODEL", "deepseek-ai/DeepSeek-R1:fastest")
+HF_REASONING_MODEL = os.getenv("HF_REASONING_MODEL", "Qwen/Qwen3-14B")
 HF_FEATURE_ENDPOINT = (
     f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL}"
 )
-HF_CHAT_ENDPOINT = "https://router.huggingface.co/v1/chat/completions"
+HF_CHAT_ENDPOINT = os.getenv("LLM_CHAT_ENDPOINT", "https://router.huggingface.co/v1/chat/completions")
+LLM_API_KEY = os.getenv("LLM_API_KEY")
 REASONING_REFRESH_DAYS = int(os.getenv("REASONING_REFRESH_DAYS", "21"))
 SEMANTIC_CANDIDATE_LIMIT = int(os.getenv("SEMANTIC_CANDIDATE_LIMIT", "60"))
 SEMANTIC_CANDIDATE_THRESHOLD = float(os.getenv("SEMANTIC_CANDIDATE_THRESHOLD", "0.25"))
 LLM_RERANK_CHUNK_SIZE = max(5, min(10, int(os.getenv("LLM_RERANK_CHUNK_SIZE", "8"))))
 LLM_RERANK_FINALIST_LIMIT = int(os.getenv("LLM_RERANK_FINALIST_LIMIT", "20"))
+PROFILE_INSIGHTS_MAX_TOKENS = int(os.getenv("PROFILE_INSIGHTS_MAX_TOKENS", "1200"))
+COURSE_SUMMARY_MAX_TOKENS = int(os.getenv("COURSE_SUMMARY_MAX_TOKENS", "1400"))
+LLM_RERANK_MAX_TOKENS = int(os.getenv("LLM_RERANK_MAX_TOKENS", "2200"))
+LLM_JSON_THINKING_MODE = os.getenv("LLM_JSON_THINKING_MODE", "off").lower()
 
 
 FIELD_KEYWORDS = {
@@ -431,7 +439,7 @@ def summarize_course_with_llm(course: dict[str, Any]) -> dict[str, Any]:
                     "role": "system",
                     "content": (
                         "You summarize PhD course pages for a course recommendation system. "
-                        "Return only valid JSON."
+                        f"{json_response_instruction()}"
                     ),
                 },
                 {
@@ -444,7 +452,7 @@ def summarize_course_with_llm(course: dict[str, Any]) -> dict[str, Any]:
                     ),
                 },
             ],
-            max_tokens=1100,
+            max_tokens=COURSE_SUMMARY_MAX_TOKENS,
         )
         raw = parse_model_json(content)
         summary = {
@@ -585,8 +593,27 @@ def hf_token() -> str:
     return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or ""
 
 
+def llm_token() -> str:
+    return LLM_API_KEY or hf_token()
+
+
+def local_llm_endpoint() -> bool:
+    return HF_CHAT_ENDPOINT.startswith(("http://localhost", "http://127.0.0.1"))
+
+
+def llm_headers() -> dict[str, str]:
+    token = llm_token()
+    return {"authorization": f"Bearer {token}"} if token else {}
+
+
+def json_response_instruction() -> str:
+    if LLM_JSON_THINKING_MODE in {"off", "false", "0", "no"}:
+        return "Return only valid JSON. Do not include chain-of-thought. /no_think"
+    return "Return only valid JSON."
+
+
 def reasoning_enabled() -> bool:
-    return bool(hf_token()) and os.getenv("REASONING_MODE") != "off"
+    return (bool(llm_token()) or local_llm_endpoint()) and os.getenv("REASONING_MODE") != "off"
 
 
 def embedding_enabled() -> bool:
@@ -671,7 +698,7 @@ def call_reasoning_llm(messages: list[dict[str, str]], max_tokens: int = 900) ->
             "max_tokens": max_tokens,
             "stream": False,
         },
-        {"authorization": f"Bearer {hf_token()}"},
+        llm_headers(),
     )
     return payload["choices"][0]["message"]["content"]
 
@@ -697,7 +724,7 @@ def get_profile_insights(profile: dict[str, Any]) -> dict[str, Any]:
                     "content": (
                         "You are a PhD course recommendation analyst for Danish universities. "
                         "Expand a student's profile into useful course-search concepts. "
-                        "Return only valid JSON."
+                        f"{json_response_instruction()}"
                     ),
                 },
                 {
@@ -708,7 +735,8 @@ def get_profile_insights(profile: dict[str, Any]) -> dict[str, Any]:
                         "searchKeywords, genericSkills, rationale."
                     ),
                 },
-            ]
+            ],
+            max_tokens=PROFILE_INSIGHTS_MAX_TOKENS,
         )
         raw = parse_model_json(content)
         insights = {
@@ -1077,7 +1105,7 @@ def rerank_candidate_chunk(
                 "content": (
                     "You are a careful PhD course recommender. You judge whether retrieved "
                     "course summaries are genuinely useful for a student's research direction. "
-                    "Return only valid JSON."
+                    f"{json_response_instruction()}"
                 ),
             },
             {
@@ -1097,7 +1125,7 @@ def rerank_candidate_chunk(
                 ),
             },
         ],
-        max_tokens=1600,
+        max_tokens=LLM_RERANK_MAX_TOKENS,
     )
     raw = parse_model_json(content)
     cache["entries"][key] = {"generatedAt": now_iso(), "raw": raw}
