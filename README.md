@@ -120,6 +120,27 @@ During scraping, the agent can visit each course URL and save a structured `cour
 
 Those stored summaries are used for recommendation ranking and embeddings.
 
+## LLM Reranking After Semantic Retrieval
+
+When `HF_TOKEN` is set, the Python backend uses a two-stage recommendation pipeline:
+
+1. Use embeddings to retrieve a generous candidate set from the saved course summaries.
+2. Split those candidate courses into chunks of 5-10.
+3. Ask the reasoning LLM to judge each chunk against the summarized user interests.
+4. Merge the LLM decisions and return the final ranked recommendations.
+
+Useful controls:
+
+```sh
+SEMANTIC_CANDIDATE_LIMIT=60
+SEMANTIC_CANDIDATE_THRESHOLD=0.25
+LLM_RERANK_CHUNK_SIZE=8
+LLM_RERANK_FINAL_PASS=true
+LLM_RERANK_MODE=on
+```
+
+Set `LLM_RERANK_MODE=off` to use semantic similarity without the LLM reranker.
+
 Useful controls:
 
 ```sh

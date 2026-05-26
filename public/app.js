@@ -86,7 +86,9 @@ function updateCacheStats(cache) {
 
 function updateRecommender(recommender) {
   recommenderMode.textContent =
-    recommender?.mode === "semantic"
+    recommender?.mode === "semantic-llm-rerank"
+      ? "LLM rerank"
+      : recommender?.mode === "semantic"
       ? "Semantic"
       : recommender?.mode === "lexical-fallback"
         ? "Fallback"

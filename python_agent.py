@@ -51,6 +51,10 @@ HF_FEATURE_ENDPOINT = (
 )
 HF_CHAT_ENDPOINT = "https://router.huggingface.co/v1/chat/completions"
 REASONING_REFRESH_DAYS = int(os.getenv("REASONING_REFRESH_DAYS", "21"))
+SEMANTIC_CANDIDATE_LIMIT = int(os.getenv("SEMANTIC_CANDIDATE_LIMIT", "60"))
+SEMANTIC_CANDIDATE_THRESHOLD = float(os.getenv("SEMANTIC_CANDIDATE_THRESHOLD", "0.25"))
+LLM_RERANK_CHUNK_SIZE = max(5, min(10, int(os.getenv("LLM_RERANK_CHUNK_SIZE", "8"))))
+LLM_RERANK_FINALIST_LIMIT = int(os.getenv("LLM_RERANK_FINALIST_LIMIT", "20"))
 
 
 FIELD_KEYWORDS = {
@@ -589,6 +593,10 @@ def embedding_enabled() -> bool:
     return bool(hf_token()) and os.getenv("RECOMMENDER_MODE") != "lexical"
 
 
+def llm_rerank_enabled() -> bool:
+    return reasoning_enabled() and os.getenv("LLM_RERANK_MODE", "on") != "off"
+
+
 def sha_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
@@ -920,9 +928,16 @@ def cosine(a: list[float], b: list[float]) -> float:
 
 
 def recommend_semantic(profile: dict[str, Any], courses: list[dict[str, Any]], limit: int = 8) -> list[dict[str, Any]]:
-    upcoming = [
-        course for course in courses if is_upcoming(course) and course_allowed_by_profile(profile, course)
-    ]
+    return retrieve_semantic_candidates(profile, courses, candidate_limit=limit, threshold=-1.0)
+
+
+def retrieve_semantic_candidates(
+    profile: dict[str, Any],
+    courses: list[dict[str, Any]],
+    candidate_limit: int = SEMANTIC_CANDIDATE_LIMIT,
+    threshold: float = SEMANTIC_CANDIDATE_THRESHOLD,
+) -> list[dict[str, Any]]:
+    upcoming = [course for course in courses if is_upcoming(course) and course_allowed_by_profile(profile, course)]
     lexical = recommend_lexical(profile, upcoming, len(upcoming))
     lexical_by_id = {course["id"]: course for course in lexical}
     items = [{"id": "profile", "text": profile_text(profile)}] + [
@@ -941,6 +956,8 @@ def recommend_semantic(profile: dict[str, Any], courses: list[dict[str, Any]], l
             {
                 **course,
                 "score": score,
+                "retrievalScore": score,
+                "semanticSimilarity": round(similarity, 4),
                 "semanticScore": round(semantic_score, 2),
                 "lexicalScore": lexical_score,
                 "reasons": [
@@ -949,7 +966,192 @@ def recommend_semantic(profile: dict[str, Any], courses: list[dict[str, Any]], l
                 ],
             }
         )
-    return sorted(ranked, key=lambda item: (-item["score"], item["title"]))[:limit]
+    ranked = sorted(ranked, key=lambda item: (-item["score"], item["title"]))
+    if threshold < 0:
+        return ranked[:candidate_limit]
+
+    above_threshold = [course for course in ranked if course["semanticSimilarity"] >= threshold]
+    minimum_candidates = min(10, candidate_limit, len(ranked))
+    if len(above_threshold) < minimum_candidates:
+        return ranked[:candidate_limit]
+    return above_threshold[:candidate_limit]
+
+
+def compact_course_for_llm(course: dict[str, Any]) -> dict[str, Any]:
+    summary = course.get("courseSummary") or {}
+    return {
+        "courseId": course.get("id"),
+        "title": course.get("title"),
+        "university": course.get("university"),
+        "phdSchool": course.get("phdSchool"),
+        "ects": course.get("ects"),
+        "dates": course.get("startDate"),
+        "city": course.get("city"),
+        "semanticSimilarity": course.get("semanticSimilarity"),
+        "retrievalScore": course.get("retrievalScore", course.get("score")),
+        "shortSummary": summary.get("shortSummary") or course.get("description", ""),
+        "description": summarize(summary.get("description") or course.get("description", ""), 650),
+        "learningOutcomes": summary.get("learningOutcomes") or [],
+        "prerequisites": summary.get("prerequisites") or "",
+        "teachingMethods": summary.get("teachingMethods") or "",
+        "audience": summary.get("audience") or "",
+        "keywords": summary.get("keywords") or [],
+    }
+
+
+def user_interest_summary(profile: dict[str, Any], insights: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        "profileText": profile_text(profile),
+        "researchArea": profile.get("area", ""),
+        "studyProgram": profile.get("studyProgram", ""),
+        "researchDirection": profile.get("researchDirection", ""),
+        "interests": profile.get("interests", ""),
+        "projectTopic": profile.get("topic", ""),
+        "methodsAndKeywords": profile.get("keywords") or profile.get("methods") or "",
+        "preferredUniversities": selected_universities(profile),
+        "ownPhdSchool": profile.get("school", ""),
+        "includeOtherSchools": bool(profile.get("includeOtherSchools")),
+        "allowedOtherSchools": profile.get("allowedOtherSchools") or [],
+        "llmInsights": insights or {},
+    }
+
+
+def normalize_rerank_decisions(raw: dict[str, Any], candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id = {str(course["id"]): course for course in candidates}
+    decisions = raw if isinstance(raw, list) else raw.get("decisions", [])
+    normalized = []
+    if not isinstance(decisions, list):
+        return normalized
+
+    for item in decisions:
+        if not isinstance(item, dict):
+            continue
+        course_id = str(item.get("courseId") or item.get("id") or "")
+        course = by_id.get(course_id)
+        if not course:
+            continue
+        try:
+            llm_score = max(0, min(100, int(float(item.get("score", 0)))))
+        except (TypeError, ValueError):
+            llm_score = 0
+        decision = str(item.get("decision", "maybe")).lower()
+        if decision not in {"recommend", "maybe", "exclude"}:
+            decision = "maybe"
+        normalized.append(
+            {
+                **course,
+                "score": llm_score,
+                "llmScore": llm_score,
+                "llmDecision": decision,
+                "fitType": str(item.get("fitType", ""))[:80],
+                "llmReason": summarize(str(item.get("reason", "")), 260),
+                "reasons": [
+                    f"LLM decision: {decision} ({llm_score}/100)",
+                    *([summarize(str(item.get("reason", "")), 220)] if item.get("reason") else []),
+                    *course.get("reasons", []),
+                ],
+            }
+        )
+    return normalized
+
+
+def rerank_candidate_chunk(
+    profile: dict[str, Any],
+    insights: dict[str, Any] | None,
+    candidates: list[dict[str, Any]],
+    chunk_index: int,
+) -> list[dict[str, Any]]:
+    summary = user_interest_summary(profile, insights)
+    compact_courses = [compact_course_for_llm(course) for course in candidates]
+    cache_payload = json.dumps({"user": summary, "courses": compact_courses}, sort_keys=True, ensure_ascii=False)
+    cache = read_json(LLM_INSIGHTS_CACHE, {"entries": {}})
+    key = f"course-rerank:{HF_REASONING_MODEL}:{sha_key(cache_payload)}"
+    cached = cache["entries"].get(key)
+    if cached:
+        return normalize_rerank_decisions(cached["raw"], candidates)
+
+    content = call_reasoning_llm(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are a careful PhD course recommender. You judge whether retrieved "
+                    "course summaries are genuinely useful for a student's research direction. "
+                    "Return only valid JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "User interest summary:\n"
+                    f"{json.dumps(summary, ensure_ascii=False, indent=2)}\n\n"
+                    f"Candidate course chunk {chunk_index}:\n"
+                    f"{json.dumps(compact_courses, ensure_ascii=False, indent=2)}\n\n"
+                    "For each course, decide if it should be recommended. Prefer courses that "
+                    "support the research direction, methods, theory, or important adjacent skills. "
+                    "Do not reward a course only because it is from a preferred university; those "
+                    "preferences were already used as filters. Return JSON exactly like: "
+                    '{"decisions":[{"courseId":"...","decision":"recommend|maybe|exclude",'
+                    '"score":0-100,"fitType":"core|method|adjacent|generic|not_relevant",'
+                    '"reason":"short reason"}]}'
+                ),
+            },
+        ],
+        max_tokens=1600,
+    )
+    raw = parse_model_json(content)
+    cache["entries"][key] = {"generatedAt": now_iso(), "raw": raw}
+    write_json(LLM_INSIGHTS_CACHE, cache)
+    return normalize_rerank_decisions(raw, candidates)
+
+
+def final_rerank_with_llm(
+    profile: dict[str, Any],
+    insights: dict[str, Any] | None,
+    candidates: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    if len(candidates) <= limit or os.getenv("LLM_RERANK_FINAL_PASS", "true") == "false":
+        return candidates[:limit]
+    finalists = candidates[:LLM_RERANK_FINALIST_LIMIT]
+    try:
+        final_decisions = rerank_candidate_chunk(profile, insights, finalists, chunk_index=999)
+    except Exception:
+        return candidates[:limit]
+    final_recommended = [course for course in final_decisions if course.get("llmDecision") != "exclude"]
+    if not final_recommended:
+        return candidates[:limit]
+    return sorted(
+        final_recommended,
+        key=lambda item: (-item.get("llmScore", item.get("score", 0)), -item.get("retrievalScore", 0), item["title"]),
+    )[:limit]
+
+
+def rerank_candidates_with_llm(
+    profile: dict[str, Any],
+    insights: dict[str, Any] | None,
+    candidates: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not llm_rerank_enabled():
+        return candidates[:limit]
+
+    decisions = []
+    for start in range(0, len(candidates), LLM_RERANK_CHUNK_SIZE):
+        chunk = candidates[start : start + LLM_RERANK_CHUNK_SIZE]
+        try:
+            decisions.extend(rerank_candidate_chunk(profile, insights, chunk, start // LLM_RERANK_CHUNK_SIZE + 1))
+        except Exception:
+            decisions.extend(chunk)
+
+    recommended = [course for course in decisions if course.get("llmDecision") != "exclude"]
+    if not recommended:
+        return candidates[:limit]
+    recommended = sorted(
+        recommended,
+        key=lambda item: (-item.get("llmScore", item.get("score", 0)), -item.get("retrievalScore", 0), item["title"]),
+    )
+    return final_rerank_with_llm(profile, insights, recommended, limit)
 
 
 def create_recommendations(profile: dict[str, Any], courses: list[dict[str, Any]], limit: int = 8) -> dict[str, Any]:
@@ -966,12 +1168,21 @@ def create_recommendations(profile: dict[str, Any], courses: list[dict[str, Any]
         }
 
     try:
+        candidates = retrieve_semantic_candidates(
+            augmented,
+            courses,
+            candidate_limit=SEMANTIC_CANDIDATE_LIMIT,
+            threshold=SEMANTIC_CANDIDATE_THRESHOLD,
+        )
+        reranked = rerank_candidates_with_llm(augmented, reasoning.get("insights"), candidates, limit)
         return {
-            "mode": "semantic",
+            "mode": "semantic-llm-rerank" if llm_rerank_enabled() else "semantic",
             "model": HF_EMBEDDING_MODEL,
+            "rerankerModel": HF_REASONING_MODEL if llm_rerank_enabled() else None,
+            "candidateCount": len(candidates),
             "reasoning": reasoning,
             "augmentedProfile": augmented,
-            "recommendations": recommend_semantic(augmented, courses, limit),
+            "recommendations": reranked,
         }
     except Exception as error:
         return {
@@ -1104,6 +1315,8 @@ class AgentHandler(SimpleHTTPRequestHandler):
                         "recommender": {
                             "mode": result["mode"],
                             "model": result["model"],
+                            "rerankerModel": result.get("rerankerModel"),
+                            "candidateCount": result.get("candidateCount"),
                             "warning": result.get("warning"),
                         },
                         "reasoning": result["reasoning"],
