@@ -1,94 +1,120 @@
 # Danish PhD Course Agent
 
-A small web app that recommends Danish PhD courses from [phdcourses.dk](https://phdcourses.dk/) based on a student's university, PhD school, research area, topic, methods, location, and ECTS preferences.
+A small web app that recommends Danish PhD courses from [phdcourses.dk](https://phdcourses.dk/) based on a student's university, PhD school, research area, research direction, interests, methods, location, and ECTS preferences.
 
-## Run
+The project has two backend options:
 
-```sh
-node server.mjs
-```
+- Python backend: `python_agent.py`, configured through `python_config.py`.
+- Node/JS backend: `server.mjs`, configured through environment variables in the shell.
 
-Open `http://localhost:3000`.
-
-This prototype has no package dependencies. `package.json` scripts are included for environments where `npm` is available.
-
-## Python Version
-
-If you prefer Python, run the equivalent backend with:
-
-```sh
-python3 python_agent.py
-```
-
-It serves the same frontend and implements the same main ideas: scraping, local lexical recommendations, reasoning expansion, semantic embeddings, subscriptions, and basic clustering. It also uses only the Python standard library.
-
-To scrape once:
-
-```sh
-MAX_SCRAPE_PAGES=2 python3 python_agent.py --scrape-once
-```
+Both backends serve the same frontend from `public/`.
 
 ## What It Does
 
 - Scrapes paginated course results from `https://phdcourses.dk/?searchWord=`.
 - Visits each course detail page, extracts fuller fields, and stores a reusable course summary.
-- Caches courses in `data/courses.json`.
-- Filters out clearly past courses.
-- Scores recommendations using research direction, interests, study programme, project topic, methods/keywords, research area, PhD school, university, location, timing, ECTS, and generic-course preference.
-- Lets users choose preferred universities and allowed PhD schools as filters. These choices do not add ranking weight; they decide which courses are eligible before scoring.
-- Uses semantic embeddings from either Hugging Face or a local OpenAI-compatible embedding server, then falls back to the local lexical scorer if the model call fails.
-- Uses a hosted or local reasoning/chat model to expand each student profile into inferred subjects, adjacent topics, methods, and search phrases.
-- Clusters saved subscribers so similar PhD profiles can be optimized together, then optionally asks the reasoning model to label clusters and suggest better search/digest strategies.
-- Enriches final recommendations from individual course pages when network access is available.
+- Uses a reasoning LLM to summarize courses and expand student research interests.
+- Uses embeddings to retrieve a broad candidate set from course summaries.
+- Uses the reasoning LLM again to rerank candidate chunks into final recommendations.
+- Lets users choose preferred universities and allowed PhD schools as filters, without adding ranking weight.
+- Clusters saved subscribers and can ask the reasoning model to label clusters and suggest better search/digest strategies.
 - Saves email digest subscribers in `data/subscribers.json`.
-- Runs a weekly digest while the server process is running.
+- Writes digest emails to `data/outbox/` unless a Resend API key is configured.
 
-## Commands
+## Python Backend
 
-```sh
-node server.mjs --scrape-once
-node server.mjs --digest-once
-```
-
-For a shorter test scrape:
+Start here if you prefer Python:
 
 ```sh
-MAX_SCRAPE_PAGES=2 node server.mjs --scrape-once
+python3 python_agent.py
 ```
 
-## Email Delivery
+Open:
 
-By default, digests are written as HTML files in `data/outbox/`.
+```text
+http://localhost:3000
+```
 
-To send real email through Resend, set:
+The Python backend uses only the Python standard library. Its configuration lives in:
+
+```text
+python_config.py
+```
+
+Change defaults there, or override them from the command line with environment variables.
+
+### Python Commands
+
+Run the web app:
 
 ```sh
-RESEND_API_KEY=...
-FROM_EMAIL="Course Agent <agent@yourdomain.dk>"
+python3 python_agent.py
 ```
 
-Then run the server or `node server.mjs --digest-once`.
-
-## Semantic Recommendations
-
-Set a Hugging Face token to enable hosted LLM reasoning and semantic matching through Hugging Face:
+Scrape courses once:
 
 ```sh
-HF_TOKEN=hf_...
+MAX_SCRAPE_PAGES=2 python3 python_agent.py --scrape-once
 ```
 
-Default models:
+Check local or hosted model endpoints:
 
 ```sh
-HF_EMBEDDING_MODEL=BAAI/bge-m3
-HF_REASONING_MODEL=Qwen/Qwen3-14B
+LLM_CHAT_ENDPOINT=http://localhost:8000/v1/chat/completions \
+EMBEDDING_ENDPOINT=http://localhost:8001/v1/embeddings \
+HF_REASONING_MODEL=Qwen/Qwen3-14B \
+HF_EMBEDDING_MODEL=BAAI/bge-m3 \
+python3 python_agent.py --check-models
 ```
 
-By default, the reasoning model uses Hugging Face's OpenAI-compatible chat completions router. It expands user profiles every few weeks by default, summarizes full course detail pages, and caches those results in `data/llm-insights.json`.
+### Python Config
 
-Embeddings are cached in `data/embeddings.json`.
+The main settings are in `python_config.py`:
 
-To run embeddings locally too, start a second OpenAI-compatible embedding server on another port. For example:
+```py
+HF_EMBEDDING_MODEL = "BAAI/bge-m3"
+HF_REASONING_MODEL = "Qwen/Qwen3-14B"
+SEMANTIC_CANDIDATE_LIMIT = 60
+LLM_RERANK_CHUNK_SIZE = 8
+COURSE_SUMMARY_MAX_TOKENS = 1400
+LLM_RERANK_MAX_TOKENS = 2200
+```
+
+The file reads environment variables too, so this still works:
+
+```sh
+REASONING_MODE=off python3 python_agent.py
+```
+
+Useful Python environment overrides:
+
+```sh
+PORT=3000
+MAX_SCRAPE_PAGES=120
+SCRAPE_FULL_DETAILS=true
+COURSE_DETAIL_LIMIT=20
+RECOMMENDER_MODE=semantic
+REASONING_MODE=on
+LLM_RERANK_MODE=on
+LLM_RERANK_FINAL_PASS=true
+REASONING_REFRESH_DAYS=21
+```
+
+## Local Models
+
+Use these model servers for either backend.
+
+Start Qwen3-14B for reasoning:
+
+```sh
+vllm serve Qwen/Qwen3-14B \
+  --dtype auto \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.84 \
+  --port 8000
+```
+
+Start BGE-M3 for embeddings:
 
 ```sh
 vllm serve BAAI/bge-m3 \
@@ -99,7 +125,7 @@ vllm serve BAAI/bge-m3 \
   --port 8001
 ```
 
-Then start the app with both local endpoints:
+Then run the Python backend with:
 
 ```sh
 LLM_CHAT_ENDPOINT=http://localhost:8000/v1/chat/completions \
@@ -109,19 +135,56 @@ HF_EMBEDDING_MODEL=BAAI/bge-m3 \
 python3 python_agent.py
 ```
 
-The local embedding endpoint does not require `HF_TOKEN`. Use `EMBEDDING_API_KEY` only if your embedding server requires a bearer token.
+Local endpoints do not require `HF_TOKEN`. Use `LLM_API_KEY` or `EMBEDDING_API_KEY` only if your local server requires bearer auth.
 
-Before a long scrape, you can test both model endpoints with:
+## Hosted Hugging Face Models
+
+If you do not run models locally, set:
 
 ```sh
-LLM_CHAT_ENDPOINT=http://localhost:8000/v1/chat/completions \
-EMBEDDING_ENDPOINT=http://localhost:8001/v1/embeddings \
-HF_REASONING_MODEL=Qwen/Qwen3-14B \
-HF_EMBEDDING_MODEL=BAAI/bge-m3 \
-python3 python_agent.py --check-models
+HF_TOKEN=hf_...
+python3 python_agent.py
 ```
 
-The Node backend has the same model check:
+By default, hosted reasoning uses Hugging Face's OpenAI-compatible chat completions router. Hosted embeddings use Hugging Face feature extraction.
+
+## Node/JS Backend
+
+Run the JavaScript backend with:
+
+```sh
+node server.mjs
+```
+
+Open:
+
+```text
+http://localhost:3000
+```
+
+The Node backend uses the same environment variables as the Python backend, but it does not use `python_config.py`.
+
+### Node Commands
+
+Run the web app:
+
+```sh
+node server.mjs
+```
+
+Scrape courses once:
+
+```sh
+MAX_SCRAPE_PAGES=2 node server.mjs --scrape-once
+```
+
+Run weekly digest once:
+
+```sh
+node server.mjs --digest-once
+```
+
+Check model endpoints:
 
 ```sh
 LLM_CHAT_ENDPOINT=http://localhost:8000/v1/chat/completions \
@@ -131,81 +194,28 @@ HF_EMBEDDING_MODEL=BAAI/bge-m3 \
 node server.mjs --check-models
 ```
 
-### Local 14B Reasoning Model
-
-With a 40 GB GPU, run the reasoning model locally behind an OpenAI-compatible server such as vLLM or SGLang. A good default for this app is `Qwen/Qwen3-14B` because it supports both thinking and non-thinking modes, has a native 32k context window, and follows structured prompts well.
-
-Example vLLM server:
-
-```sh
-vllm serve Qwen/Qwen3-14B \
-  --dtype auto \
-  --max-model-len 32768 \
-  --gpu-memory-utilization 0.84 \
-  --port 8000
-```
-
-The model supports this larger context window. If vLLM reports an out-of-memory error while Qwen and BGE-M3 share one 40 GB GPU, reduce `--gpu-memory-utilization` for the embedding server or use a quantized Qwen model.
-
-Then point the Python app at it:
+Run Node with local models:
 
 ```sh
 LLM_CHAT_ENDPOINT=http://localhost:8000/v1/chat/completions \
+EMBEDDING_ENDPOINT=http://localhost:8001/v1/embeddings \
 HF_REASONING_MODEL=Qwen/Qwen3-14B \
-python3 python_agent.py
+HF_EMBEDDING_MODEL=BAAI/bge-m3 \
+node server.mjs
 ```
 
-For JSON tasks, the app defaults to asking Qwen-style models not to emit thinking text. If you want explicit thinking mode, increase the output budgets and set:
+## Recommendation Pipeline
 
-```sh
-LLM_JSON_THINKING_MODE=on
-PROFILE_INSIGHTS_MAX_TOKENS=2000
-COURSE_SUMMARY_MAX_TOKENS=2200
-LLM_RERANK_MAX_TOKENS=4000
-```
+1. Scrape upcoming courses from `phdcourses.dk`.
+2. Visit each course link and extract full details.
+3. Ask the reasoning LLM to summarize each course into structured fields.
+4. Embed the user profile and course summaries.
+5. Retrieve a generous semantic candidate set.
+6. Split candidates into chunks of 5-10 courses.
+7. Ask the reasoning LLM to decide `recommend`, `maybe`, or `exclude`.
+8. Return the final ranked recommendations.
 
-To force the original local matcher:
-
-```sh
-RECOMMENDER_MODE=lexical
-```
-
-To disable LLM reasoning but keep embeddings:
-
-```sh
-REASONING_MODE=off
-```
-
-To change how often profile and cluster reasoning refreshes:
-
-```sh
-REASONING_REFRESH_DAYS=14
-```
-
-## Full Course Summaries
-
-During scraping, the agent can visit each course URL and save a structured `courseSummary` on every course:
-
-- `shortSummary`
-- `description`
-- `learningOutcomes`
-- `prerequisites`
-- `teachingMethods`
-- `audience`
-- `keywords`
-
-Those stored summaries are used for recommendation ranking and embeddings.
-
-## LLM Reranking After Semantic Retrieval
-
-When embeddings are enabled, both backends use a two-stage recommendation pipeline:
-
-1. Use embeddings to retrieve a generous candidate set from the saved course summaries.
-2. Split those candidate courses into chunks of 5-10.
-3. Ask the reasoning LLM to judge each chunk against the summarized user interests.
-4. Merge the LLM decisions and return the final ranked recommendations.
-
-Useful controls:
+Useful controls for both backends:
 
 ```sh
 SEMANTIC_CANDIDATE_LIMIT=60
@@ -217,18 +227,23 @@ PROFILE_INSIGHTS_MAX_TOKENS=1200
 COURSE_SUMMARY_MAX_TOKENS=1400
 LLM_RERANK_MAX_TOKENS=2200
 CLUSTER_INSIGHTS_MAX_TOKENS=1800
+LLM_JSON_THINKING_MODE=off
 ```
 
 Set `LLM_RERANK_MODE=off` to use semantic similarity without the LLM reranker.
 
-Useful controls:
+Set `RECOMMENDER_MODE=lexical` to use the original local keyword matcher.
+
+## Email Delivery
+
+By default, digests are written as HTML files in `data/outbox/`.
+
+To send real email through Resend, set:
 
 ```sh
-SCRAPE_FULL_DETAILS=false node server.mjs --scrape-once
-COURSE_DETAIL_LIMIT=20 node server.mjs --scrape-once
+RESEND_API_KEY=...
+FROM_EMAIL="Course Agent <agent@yourdomain.dk>"
 ```
-
-The same variables work for `python3 python_agent.py --scrape-once`.
 
 ## API
 

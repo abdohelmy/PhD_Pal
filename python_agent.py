@@ -21,51 +21,53 @@ import hashlib
 import html
 import json
 import math
-import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urljoin, urlparse
 from urllib.request import Request, urlopen
 
-
-ROOT = Path(__file__).resolve().parent
-PUBLIC_DIR = ROOT / "public"
-DATA_DIR = ROOT / "data"
-COURSE_CACHE = DATA_DIR / "courses.json"
-SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
-EMBEDDING_CACHE = DATA_DIR / "embeddings.json"
-LLM_INSIGHTS_CACHE = DATA_DIR / "llm-insights.json"
-OUTBOX_DIR = DATA_DIR / "outbox"
-
-SOURCE_BASE = "https://phdcourses.dk"
-USER_AGENT = "Danish PhD Course Recommendation Agent Python/0.1"
-PORT = int(os.getenv("PORT", "3000"))
-HF_EMBEDDING_MODEL = os.getenv(
-    "HF_EMBEDDING_MODEL", "BAAI/bge-m3"
+from python_config import (
+    CLUSTER_INSIGHTS_MAX_TOKENS,
+    CLUSTER_REASONING_MODE,
+    COURSE_CACHE,
+    COURSE_DETAIL_LIMIT,
+    COURSE_SUMMARY_MAX_TOKENS,
+    DATA_DIR,
+    EMBEDDING_API_KEY,
+    EMBEDDING_CACHE,
+    EMBEDDING_ENDPOINT,
+    HF_CHAT_ENDPOINT,
+    HF_EMBEDDING_MODEL,
+    HF_REASONING_MODEL,
+    HF_TOKEN,
+    LLM_API_KEY,
+    LLM_INSIGHTS_CACHE,
+    LLM_JSON_THINKING_MODE,
+    LLM_RERANK_CHUNK_SIZE,
+    LLM_RERANK_FINAL_PASS,
+    LLM_RERANK_FINALIST_LIMIT,
+    LLM_RERANK_MAX_TOKENS,
+    LLM_RERANK_MODE,
+    MAX_SCRAPE_PAGES,
+    OUTBOX_DIR,
+    PORT,
+    PROFILE_INSIGHTS_MAX_TOKENS,
+    PUBLIC_DIR,
+    REASONING_MODE,
+    REASONING_REFRESH_DAYS,
+    RECOMMENDER_MODE,
+    SCRAPE_FULL_DETAILS,
+    SEMANTIC_CANDIDATE_LIMIT,
+    SEMANTIC_CANDIDATE_THRESHOLD,
+    SOURCE_BASE,
+    SUBSCRIBERS_FILE,
+    USER_AGENT,
 )
-HF_REASONING_MODEL = os.getenv("HF_REASONING_MODEL", "Qwen/Qwen3-14B")
-HF_FEATURE_ENDPOINT = (
-    f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL}"
-)
-EMBEDDING_ENDPOINT = os.getenv("EMBEDDING_ENDPOINT", HF_FEATURE_ENDPOINT)
-EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
-HF_CHAT_ENDPOINT = os.getenv("LLM_CHAT_ENDPOINT", "https://router.huggingface.co/v1/chat/completions")
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-REASONING_REFRESH_DAYS = int(os.getenv("REASONING_REFRESH_DAYS", "21"))
-SEMANTIC_CANDIDATE_LIMIT = int(os.getenv("SEMANTIC_CANDIDATE_LIMIT", "60"))
-SEMANTIC_CANDIDATE_THRESHOLD = float(os.getenv("SEMANTIC_CANDIDATE_THRESHOLD", "0.25"))
-LLM_RERANK_CHUNK_SIZE = max(5, min(10, int(os.getenv("LLM_RERANK_CHUNK_SIZE", "8"))))
-LLM_RERANK_FINALIST_LIMIT = int(os.getenv("LLM_RERANK_FINALIST_LIMIT", "20"))
-PROFILE_INSIGHTS_MAX_TOKENS = int(os.getenv("PROFILE_INSIGHTS_MAX_TOKENS", "1200"))
-COURSE_SUMMARY_MAX_TOKENS = int(os.getenv("COURSE_SUMMARY_MAX_TOKENS", "1400"))
-LLM_RERANK_MAX_TOKENS = int(os.getenv("LLM_RERANK_MAX_TOKENS", "2200"))
-CLUSTER_INSIGHTS_MAX_TOKENS = int(os.getenv("CLUSTER_INSIGHTS_MAX_TOKENS", "1800"))
-LLM_JSON_THINKING_MODE = os.getenv("LLM_JSON_THINKING_MODE", "off").lower()
 
 
 FIELD_KEYWORDS = {
@@ -530,8 +532,8 @@ def scrape_courses(max_pages: int | None = None) -> dict[str, Any]:
             course_map[course["id"]] = course
 
     listed_courses = sorted(course_map.values(), key=lambda c: f"{c.get('startDate')} {c.get('title')}")
-    summarize_details = os.getenv("SCRAPE_FULL_DETAILS", "true") != "false"
-    detail_limit = int(os.getenv("COURSE_DETAIL_LIMIT", str(len(listed_courses))))
+    summarize_details = SCRAPE_FULL_DETAILS != "false"
+    detail_limit = int(COURSE_DETAIL_LIMIT or len(listed_courses))
     courses = []
     for course in listed_courses:
         if summarize_details and len(courses) < detail_limit:
@@ -593,7 +595,7 @@ def course_allowed_by_profile(profile: dict[str, Any], course: dict[str, Any]) -
 
 
 def hf_token() -> str:
-    return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or ""
+    return HF_TOKEN
 
 
 def llm_token() -> str:
@@ -629,16 +631,16 @@ def json_response_instruction() -> str:
 
 
 def reasoning_enabled() -> bool:
-    return (bool(llm_token()) or local_llm_endpoint()) and os.getenv("REASONING_MODE") != "off"
+    return (bool(llm_token()) or local_llm_endpoint()) and REASONING_MODE != "off"
 
 
 def embedding_enabled() -> bool:
     has_embedding_access = bool(EMBEDDING_API_KEY or hf_token()) or local_embedding_endpoint()
-    return has_embedding_access and os.getenv("RECOMMENDER_MODE") != "lexical"
+    return has_embedding_access and RECOMMENDER_MODE != "lexical"
 
 
 def llm_rerank_enabled() -> bool:
-    return reasoning_enabled() and os.getenv("LLM_RERANK_MODE", "on") != "off"
+    return reasoning_enabled() and LLM_RERANK_MODE != "off"
 
 
 def sha_key(value: str) -> str:
@@ -1228,7 +1230,7 @@ def final_rerank_with_llm(
     candidates: list[dict[str, Any]],
     limit: int,
 ) -> list[dict[str, Any]]:
-    if len(candidates) <= limit or os.getenv("LLM_RERANK_FINAL_PASS", "true") == "false":
+    if len(candidates) <= limit or LLM_RERANK_FINAL_PASS == "false":
         return candidates[:limit]
     finalists = candidates[:LLM_RERANK_FINALIST_LIMIT]
     try:
@@ -1322,7 +1324,7 @@ def cluster_terms(profiles: list[dict[str, Any]]) -> list[str]:
 
 
 def cluster_insights_with_llm(clusters: list[dict[str, Any]]) -> dict[str, Any]:
-    if not reasoning_enabled() or os.getenv("CLUSTER_REASONING_MODE", "on") == "off" or not clusters:
+    if not reasoning_enabled() or CLUSTER_REASONING_MODE == "off" or not clusters:
         return {"mode": "disabled", "model": None, "insights": []}
 
     compact_clusters = [
@@ -1552,12 +1554,12 @@ class AgentHandler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     ensure_dirs()
-    if "--check-models" in os.sys.argv:
+    if "--check-models" in sys.argv:
         print(json.dumps(check_model_endpoints(), indent=2, ensure_ascii=False))
         return
 
-    if "--scrape-once" in os.sys.argv:
-        cache = scrape_courses(max_pages=int(os.getenv("MAX_SCRAPE_PAGES", "120")))
+    if "--scrape-once" in sys.argv:
+        cache = scrape_courses(max_pages=MAX_SCRAPE_PAGES)
         print(f"Scraped {cache['count']} courses from {cache['totalPages']} pages.")
         return
 
